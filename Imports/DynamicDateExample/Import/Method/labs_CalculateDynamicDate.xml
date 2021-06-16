@@ -1,0 +1,157 @@
+﻿<AML>
+ <Item type="Method" id="EB3AB2B9C9DD46BEB8A63A16A23A6A07" action="add">
+  <execution_allowed_to keyed_name="Administrators" type="Identity">2618D6F5A90949BAA7E920D1B04C7EE1</execution_allowed_to>
+  <method_code><![CDATA[    Innovator inn = this.getInnovator();
+
+    // Hard code in the dates to check (faster but )
+    List<string> datePropsToCheck = new List<string> { "created_on", "modified_on", "effective_date" };
+
+    // Look up the date properties based on the ItemType (slower but more dynamic)
+    string itemTypeName = this.getType();
+
+    Item dateProps = inn.newItem("Property", "get");
+    dateProps.setProperty("data_type", "date");
+    dateProps.setAttribute("select", "name");
+    Item sourceIT = dateProps.createPropertyItem("source_id", "ItemType", "get");
+    sourceIT.setProperty("keyed_name", itemTypeName);
+    sourceIT.setAttribute("select", "id");
+    dateProps = dateProps.apply();
+
+    List<string> datePropNames = new List<string>();
+    for (int i = 0, numProps = dateProps.getItemCount(); i < numProps; i++)
+    {
+        Item dateProp = dateProps.getItemByIndex(i);
+        string datePropName = dateProp.getProperty("name", "");
+        if (string.IsNullOrEmpty(datePropName))
+        {
+            return inn.newError($"Could not read name for property with ID: { dateProp.getID() }");
+        }
+        datePropNames.Add(dateProp.getProperty("name"));
+    }
+
+    // Look through all of the properties on this item and make any replacements that we need to
+    for (int i = 0; i < datePropNames.Count; i++)
+    {
+        string datePropName = datePropNames[i];
+        string datePropValue = this.getProperty(datePropName, "");
+        
+        if (!string.IsNullOrEmpty(datePropValue))
+        {
+            string evaluatedDate = EvaluateDateCalculation(datePropValue);
+            this.setProperty(datePropName, evaluatedDate);
+            if (evaluatedDate != datePropValue)
+            {
+                this.setPropertyAttribute(datePropName, "condition", "between");
+            }
+        }
+    }
+
+    // We want to support this both as a server event and as a standalone action, so we will check the action to see where this
+    // is being called
+    string actionName = this.getAction();
+    string thisMethodName = "labs_CalculateDynamicDate";
+    if (actionName == thisMethodName)
+    {
+        this.setAction("get");
+        return this.apply();
+    }
+
+    return this;
+
+} // <-- This closing bracket lets us define helper functions below
+
+public string EvaluateDateCalculation(string dateValue)
+{
+    // Look for any replacement strings in the value
+    /*
+     * Explanation of Regex:
+     *  We basically want a convenient means of determining if the user is trying to use a dynamic value while also minimizing the amount
+     *  of user error when entering that value. For example, we want to the user to be able to enter any of the following values:
+     *
+     *  Examples of possible dyanmic values
+     *      2 + TODAY()
+     *      234 - TODAY()
+     *      1+TODAY()
+     *      TODAY()+1
+     *      TODAY() -7
+     *      TODAY() +    14
+     *      3 + TODAY() - 9
+     *
+     *  Regex allows us to do this very easily and also lets us set up a few different
+     *  capturing groups that will let us compute the final value the date is supposed to be. While we won't explain the full Regex
+     *  expression, we will cover what the different capturing groups mean. 
+     *
+     * This Regex is split into a few different capturing groups that will let us compute the final value that the date is supposed to be
+     *
+     * Group 1:
+     *  ([0-9]+) - Capture one or more numbers at the start of the expression
+     *
+     * Group 2:
+     *  ([+-]) - Capture what operation is being performed at the start of the expression
+     *
+     * Group 3:
+     *  (TODAY\(\)) - Capture the date variable
+     *
+     * Group 4:
+     *  ([+-]) - Capture what operation is being performed at the end of the expression
+     *
+     * Group 5:
+     *  ([0-9]+) - Capture one or more numbers at the end of the expression
+     *
+     * If we consider the example string "14 + TODAY() - 7" then the groups would store the following values:
+     *  Group 1: 14
+     *  Group 2: +
+     *  Group 3: TODAY()
+     *  Group 4: -
+     *  Group 5: 7
+     */
+    string dateFormula = @"(?:([0-9]+)[\s]*([+-])[\s]*)?(TODAY\(\))(?:[\s]*([+-])[\s]*([0-9]+))?";
+    System.Text.RegularExpressions.Regex dateRegex = new System.Text.RegularExpressions.Regex(dateFormula);
+
+    System.Text.RegularExpressions.Match dateMatch = dateRegex.Match(dateValue);
+    if (dateMatch.Success)
+    {
+        System.Text.RegularExpressions.GroupCollection calcGroups = dateMatch.Groups;
+
+        // Find the base date (Right now, only TODAY() is supported, but something like DATE(1, 1, 2021) might be supported later)
+        var baseDateGroup = calcGroups[3];
+        DateTime dateToReturn = new DateTime();
+        if (baseDateGroup.Value == "TODAY()")
+        {
+            dateToReturn = DateTime.Now;
+        }
+
+        dateToReturn = HandleDateChange(dateToReturn, calcGroups[1], calcGroups[2]);
+        dateToReturn = HandleDateChange(dateToReturn, calcGroups[5], calcGroups[4]);
+
+        // In order to have this actually be useful as a query, we need to set up a condition to get all dates that lie between
+        // Midnight and 11:59 PM (or 23:59) of the selected date
+        string midnightDateFormat = "yyyy-MM-ddT00:00:00";
+        string lastMinuteFormat = "yyyy-MM-ddT23:59:59";
+        return $"{dateToReturn.ToString(midnightDateFormat)} and {dateToReturn.ToString(lastMinuteFormat)}";
+    }
+
+    // If our regular expression did not match anything, then that means 
+    // this is just a normal date that we can pass along without modification
+    return dateValue;
+}
+
+public DateTime HandleDateChange(DateTime date, System.Text.RegularExpressions.Group numDaysGroup, System.Text.RegularExpressions.Group modifierGroup)
+{
+    if (numDaysGroup.Success && modifierGroup.Success)
+    {
+        int numDays = Int32.Parse(numDaysGroup.Value);
+        string modifier = modifierGroup.Value;
+
+        return date.AddDays((modifier == "+") ? numDays : (numDays * -1));
+    }
+
+    // Just return the base date if the groups were not found
+    return date;
+
+// <-- Intentionally leaving off closing bracket
+]]></method_code>
+  <method_type>C#</method_type>
+  <name>labs_CalculateDynamicDate</name>
+ </Item>
+</AML>
